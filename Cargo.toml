@@ -3,10 +3,18 @@ name = "shuffly"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
 name = "shuffly"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "shuffly"
+path = "src/main.rs"
 
 [dependencies]
-pyo3 = "0.25.0"
+pyo3 = { version = "0.25.0", optional = true }  # Make optional
+clap = { version = "4.0", features = ["derive"] }
+
+[features]
+default = []
+python = ["pyo3"]
