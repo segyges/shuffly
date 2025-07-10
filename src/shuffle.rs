@@ -85,7 +85,7 @@ pub fn shuffle_jsonl(config: &ShuffleConfig) -> Result<Vec<PathBuf>, io::Error> 
         let filename = if num_output_files == 1 {
             format!("{}.jsonl", config.output_name)
         } else {
-            format!("{}_part_{:03}.jsonl", config.output_name, i + 1)
+            format!("{}_part_{:04}.jsonl", config.output_name, i + 1)
         };
         
         let output_path = config.output_dir.join(filename);
