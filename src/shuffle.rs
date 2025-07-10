@@ -5,7 +5,7 @@ use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use rand::prelude::*;
 use rand::rngs::StdRng;
-use rand::{SeedableRng, thread_rng, RngCore};
+use rand::{SeedableRng, rng, RngCore};
 
 #[derive(Debug, Clone)]
 pub struct ShuffleConfig {
@@ -96,7 +96,7 @@ async fn phase_1_distribute(config: &ShuffleConfig) -> Result<Vec<PathBuf>, io::
     // Initialize RNG with seed for deterministic behavior
     let mut rng: Box<dyn RngCore> = match config.seed {
         Some(seed) => Box::new(StdRng::seed_from_u64(seed)),
-        None => Box::new(thread_rng()),
+        None => Box::new(rng()),
     };
     let mut total_lines = 0;
     
@@ -115,7 +115,7 @@ async fn phase_1_distribute(config: &ShuffleConfig) -> Result<Vec<PathBuf>, io::
         while let Some(line) = lines.next_line().await? {
             if !line.trim().is_empty() {
                 // Randomly assign to one of the temp files
-                let temp_index = rng.gen_range(0..temp_writers.len());
+                let temp_index = rng.random_range(0..temp_writers.len());
                 temp_writers[temp_index].write_all(line.as_bytes()).await?;
                 temp_writers[temp_index].write_all(b"\n").await?;
                 total_lines += 1;
@@ -142,7 +142,7 @@ async fn phase_2_shuffle_and_write(
     let mut output_files = Vec::new();
     let mut rng: Box<dyn RngCore> = match config.seed {
         Some(seed) => Box::new(StdRng::seed_from_u64(seed.wrapping_add(1))), // Different seed for phase 2
-        None => Box::new(thread_rng()),
+        None => Box::new(rng()),
     };
     
     for (i, temp_file) in temp_files.iter().enumerate() {
