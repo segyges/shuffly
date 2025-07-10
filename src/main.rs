@@ -24,7 +24,7 @@ struct Cli {
     output_name: String,
     
     /// Maximum size per output file in MB
-    #[arg(short = 's', long, default_value_t = 2048)]
+    #[arg(short = 's', long, default_value_t = 4096)]
     max_size_mb: usize,
     
     /// Random seed for deterministic shuffling
