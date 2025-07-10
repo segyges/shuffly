@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{PathBuf};
 use std::fs;
 use std::io;
 use async_compression::tokio::bufread::GzipDecoder;
@@ -326,19 +326,4 @@ async fn estimate_total_input_size(input_files: &[PathBuf]) -> Result<usize, io:
         total_size += metadata.len() as usize;
     }
     Ok(total_size)
-}
-
-pub async fn count_lines_in_file(file_path: &Path) -> Result<usize, io::Error> {
-    let file = File::open(file_path).await?;
-    let reader = BufReader::new(file);
-    let mut lines = reader.lines();
-    let mut count = 0;
-    
-    while let Some(line) = lines.next_line().await? {
-        if !line.trim().is_empty() {
-            count += 1;
-        }
-    }
-    
-    Ok(count)
 }
