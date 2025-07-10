@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::fs;
 use std::io;
@@ -72,6 +73,91 @@ pub async fn shuffle_jsonl(config: &ShuffleConfig) -> Result<Vec<PathBuf>, io::E
     Ok(output_files)
 }
 
+struct LineBuffer {
+    lines: Vec<(usize, String)>, // (temp_file_index, line_content)
+    total_size: usize,
+}
+
+impl LineBuffer {
+    fn new() -> Self {
+        Self {
+            lines: Vec::new(),
+            total_size: 0,
+        }
+    }
+    
+    fn add_line(&mut self, temp_index: usize, line: String) {
+        self.total_size += line.len();
+        self.lines.push((temp_index, line));
+    }
+    
+    fn is_full(&self, max_size: usize) -> bool {
+        self.total_size >= max_size
+    }
+    
+    fn clear(&mut self) {
+        self.lines.clear();
+        self.total_size = 0;
+    }
+    
+    fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+}
+
+async fn flush_line_buffer(
+    buffer: &mut LineBuffer,
+    temp_files: &[PathBuf],
+    max_open_files: usize,
+) -> Result<(), io::Error> {
+    if buffer.is_empty() {
+        return Ok(());
+    }
+    
+    // Group lines by temp file index
+    let mut lines_by_file: HashMap<usize, Vec<String>> = HashMap::new();
+    for (temp_index, line) in buffer.lines.drain(..) {
+        lines_by_file.entry(temp_index).or_default().push(line);
+    }
+    
+    // Process files in batches to limit open file descriptors
+    let file_indices: Vec<usize> = lines_by_file.keys().cloned().collect();
+    
+    for chunk in file_indices.chunks(max_open_files) {
+        let mut writers = Vec::new();
+        let mut indices = Vec::new();
+        
+        // Open files in this batch
+        for &file_idx in chunk {
+            let file = tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&temp_files[file_idx])
+                .await?;
+            writers.push(BufWriter::new(file));
+            indices.push(file_idx);
+        }
+        
+        // Write all lines for files in this batch
+        for (writer_idx, &file_idx) in indices.iter().enumerate() {
+            if let Some(lines) = lines_by_file.get(&file_idx) {
+                for line in lines {
+                    writers[writer_idx].write_all(line.as_bytes()).await?;
+                    writers[writer_idx].write_all(b"\n").await?;
+                }
+            }
+        }
+        
+        // Flush and close all writers in this batch
+        for mut writer in writers {
+            writer.flush().await?;
+        }
+    }
+    
+    buffer.clear();
+    Ok(())
+}
+
 async fn phase_1_distribute(config: &ShuffleConfig) -> Result<Vec<PathBuf>, io::Error> {
     println!("Phase 1: Distributing lines to temporary files...");
     
@@ -82,17 +168,17 @@ async fn phase_1_distribute(config: &ShuffleConfig) -> Result<Vec<PathBuf>, io::
     
     println!("Estimated {} output files needed", estimated_num_files);
     
-    // Create temp files
+    // Create temp file paths (but don't open them yet)
     let mut temp_files = Vec::new();
-    let mut temp_writers = Vec::new();
-    
     for i in 0..estimated_num_files {
         let temp_path = config.output_dir.join(format!(".{}_temp_{:04}.jsonl", config.output_name, i));
-        let file = File::create(&temp_path).await?;
-        let writer = BufWriter::new(file);
         temp_files.push(temp_path);
-        temp_writers.push(writer);
     }
+    
+    // Configuration for batched processing
+    const MAX_OPEN_INPUT_FILES: usize = 16;
+    const MAX_OPEN_OUTPUT_FILES: usize = 128;
+    const MAX_BUFFER_SIZE: usize = 1024 * 1024 * 1024; // 1GB
     
     // Initialize RNG with seed for deterministic behavior
     let mut rng: Box<dyn RngCore> = match config.seed {
@@ -100,41 +186,69 @@ async fn phase_1_distribute(config: &ShuffleConfig) -> Result<Vec<PathBuf>, io::
         None => Box::new(rng()),
     };
     let mut total_lines = 0;
+    let mut line_buffer = LineBuffer::new();
     
     // Process input files in sorted order for deterministic behavior
     let mut sorted_input_files = config.input_files.clone();
     sorted_input_files.sort();
-			
-	// Process each input file
-		for input_file in &sorted_input_files {
-				println!("Processing {}", input_file.display());
-				
-				let file = File::open(input_file).await?;
-				let buf_reader = BufReader::new(file);
-				
-				// Create a boxed reader that can handle both cases
-				let reader: Box<dyn AsyncBufRead + Unpin> = if input_file.extension().and_then(|s| s.to_str()) == Some("gz") {
-						Box::new(BufReader::new(GzipDecoder::new(buf_reader)))
-				} else {
-						Box::new(buf_reader)
-				};
-				
-				let mut lines = reader.lines();
-				
-				while let Some(line) = lines.next_line().await? {
-						if !line.trim().is_empty() {
-								// Randomly assign to one of the temp files
-								let temp_index = rng.random_range(0..temp_writers.len());
-								temp_writers[temp_index].write_all(line.as_bytes()).await?;
-								temp_writers[temp_index].write_all(b"\n").await?;
-								total_lines += 1;
-						}
-				}
-		}
-				
-    // Flush and close all temp writers
-    for mut writer in temp_writers {
-        writer.flush().await?;
+    
+    // Process input files in batches
+    for input_batch in sorted_input_files.chunks(MAX_OPEN_INPUT_FILES) {
+        let mut readers = Vec::new();
+        
+        // Open input files in this batch
+        for input_file in input_batch {
+            println!("Processing {}", input_file.display());
+            
+            let file = File::open(input_file).await?;
+            let buf_reader = BufReader::new(file);
+            
+            // Create a boxed reader that can handle both cases
+            let reader: Box<dyn AsyncBufRead + Unpin> = if input_file.extension().and_then(|s| s.to_str()) == Some("gz") {
+                Box::new(BufReader::new(GzipDecoder::new(buf_reader)))
+            } else {
+                Box::new(buf_reader)
+            };
+            
+            readers.push(reader.lines());
+        }
+        
+        // Round-robin through readers in this batch
+        let mut active_readers = (0..readers.len()).collect::<Vec<_>>();
+        
+        while !active_readers.is_empty() {
+            let mut finished_readers = Vec::new();
+            
+            for (idx, &reader_idx) in active_readers.iter().enumerate() {
+                // Try to read a line from this reader
+                if let Some(line) = readers[reader_idx].next_line().await? {
+                    if !line.trim().is_empty() {
+                        // Randomly assign to one of the temp files
+                        let temp_index = rng.random_range(0..temp_files.len());
+                        line_buffer.add_line(temp_index, line);
+                        total_lines += 1;
+                        
+                        // Check if buffer is full
+                        if line_buffer.is_full(MAX_BUFFER_SIZE) {
+                            flush_line_buffer(&mut line_buffer, &temp_files, MAX_OPEN_OUTPUT_FILES).await?;
+                        }
+                    }
+                } else {
+                    // This reader is finished
+                    finished_readers.push(idx);
+                }
+            }
+            
+            // Remove finished readers (in reverse order to maintain indices)
+            for &idx in finished_readers.iter().rev() {
+                active_readers.remove(idx);
+            }
+        }
+    }
+    
+    // Flush any remaining lines in the buffer
+    if !line_buffer.is_empty() {
+        flush_line_buffer(&mut line_buffer, &temp_files, MAX_OPEN_OUTPUT_FILES).await?;
     }
     
     println!("Phase 1 complete: {} lines distributed across {} temp files", total_lines, temp_files.len());
