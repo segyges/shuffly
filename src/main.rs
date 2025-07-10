@@ -40,20 +40,20 @@ fn collect_jsonl_files(dir: &str) -> Result<Vec<String>, Box<dyn std::error::Err
         return Err(format!("'{}' is not a directory", dir).into());
     }
     
-    for entry in fs::read_dir(dir_path)? {
-        let entry = entry?;
-        let path = entry.path();
-        
-        if path.is_file() {
-            if let Some(extension) = path.extension() {
-                if extension == "jsonl" {
-                    if let Some(path_str) = path.to_str() {
-                        jsonl_files.push(path_str.to_string());
-                    }
-                }
-            }
-        }
-    }
+	for entry in fs::read_dir(dir_path)? {
+			let entry = entry?;
+			let path = entry.path();
+			
+			if path.is_file() {
+					let path_str = path.to_string_lossy();
+					
+					if path_str.ends_with(".jsonl") || path_str.ends_with(".jsonl.gz") {
+							if let Some(path_str) = path.to_str() {
+									jsonl_files.push(path_str.to_string());
+							}
+					}
+			}
+	}
     
     if jsonl_files.is_empty() {
         return Err(format!("No .jsonl files found in directory '{}'", dir).into());
