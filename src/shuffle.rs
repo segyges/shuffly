@@ -1,8 +1,11 @@
 use std::path::{Path, PathBuf};
 use std::fs;
-use std::io::{self, Write};
-use rand::seq::SliceRandom;
-use rand::rng;
+use std::io;
+use tokio::fs::File;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use rand::prelude::*;
+use rand::rngs::StdRng;
+use rand::{SeedableRng, thread_rng, RngCore};
 
 #[derive(Debug, Clone)]
 pub struct ShuffleConfig {
@@ -10,6 +13,7 @@ pub struct ShuffleConfig {
     pub output_dir: PathBuf,
     pub output_name: String,
     pub max_size_mb: usize,
+    pub seed: Option<u64>,
 }
 
 impl ShuffleConfig {
@@ -18,6 +22,7 @@ impl ShuffleConfig {
         output_dir: &str,
         output_name: &str,
         max_size_mb: usize,
+        seed: Option<u64>,
     ) -> Result<Self, io::Error> {
         let input_files = parse_input_files(input_files_str)?;
         let output_dir = PathBuf::from(output_dir);
@@ -32,6 +37,7 @@ impl ShuffleConfig {
             output_dir,
             output_name: output_name.to_string(),
             max_size_mb,
+            seed,
         })
     }
 }
@@ -55,105 +61,161 @@ fn parse_input_files(input_str: &str) -> Result<Vec<PathBuf>, io::Error> {
     Ok(files)
 }
 
-pub fn shuffle_jsonl(config: &ShuffleConfig) -> Result<Vec<PathBuf>, io::Error> {
-    // Read all lines from all input files
-    let mut all_lines = Vec::new();
+pub async fn shuffle_jsonl(config: &ShuffleConfig) -> Result<Vec<PathBuf>, io::Error> {
+    // Phase 1: Distribute lines from input files to temporary files
+    let temp_files = phase_1_distribute(config).await?;
     
-    for file in &config.input_files {
-        let content = fs::read_to_string(file)?;
-        for line in content.lines() {
-            if !line.trim().is_empty() {
-                all_lines.push(line.to_string());
-            }
-        }
-    }
-    
-    println!("Read {} lines from {} files", all_lines.len(), config.input_files.len());
-    
-    if all_lines.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "No lines found in input files"
-        ));
-    }
-    
-    // Shuffle the lines
-    let mut rng = rng();
-    all_lines.shuffle(&mut rng);
-    println!("Shuffled {} lines", all_lines.len());
-    
-    // Calculate how to split the lines across output files
-    let max_size_bytes = config.max_size_mb * 1024 * 1024;
-    let mut output_files = Vec::new();
-    let mut current_size = 0;
-    let mut current_file_lines = Vec::new();
-    let mut file_index = 0;
-    
-    for line in all_lines {
-        let line_size = line.len() + 1; // +1 for newline
-        
-        // Check if adding this line would exceed the size limit
-        if current_size + line_size > max_size_bytes && !current_file_lines.is_empty() {
-            // Write current file
-            let output_path = write_output_file(
-                &config.output_dir,
-                &config.output_name,
-                file_index,
-                &current_file_lines,
-            )?;
-            output_files.push(output_path);
-            
-            // Start new file
-            current_file_lines.clear();
-            current_size = 0;
-            file_index += 1;
-        }
-        
-        current_file_lines.push(line);
-        current_size += line_size;
-    }
-    
-    // Write the last file if it has content
-    if !current_file_lines.is_empty() {
-        let output_path = write_output_file(
-            &config.output_dir,
-            &config.output_name,
-            file_index,
-            &current_file_lines,
-        )?;
-        output_files.push(output_path);
-    }
-    
-    println!("Successfully wrote {} output files", output_files.len());
+    // Phase 2: Shuffle each temp file and write to final output files
+    let output_files = phase_2_shuffle_and_write(config, temp_files).await?;
     
     Ok(output_files)
 }
 
-fn write_output_file(
-    output_dir: &Path,
-    output_name: &str,
-    file_index: usize,
-    lines: &[String],
-) -> Result<PathBuf, io::Error> {
-    let filename = if file_index == 0 && lines.len() < 1000000 { // Heuristic for single file
-        format!("{}.jsonl", output_name)
-    } else {
-        format!("{}_part_{:04}.jsonl", output_name, file_index + 1)
-    };
+async fn phase_1_distribute(config: &ShuffleConfig) -> Result<Vec<PathBuf>, io::Error> {
+    println!("Phase 1: Distributing lines to temporary files...");
     
-    let output_path = output_dir.join(filename);
-    let mut file = fs::File::create(&output_path)?;
+    // Estimate number of output files based on total input size
+    let total_input_size = estimate_total_input_size(&config.input_files).await?;
+    let max_size_bytes = config.max_size_mb * 1024 * 1024;
+    let estimated_num_files = ((total_input_size + max_size_bytes - 1) / max_size_bytes).max(1);
     
-    for line in lines {
-        writeln!(file, "{}", line)?;
+    println!("Estimated {} output files needed", estimated_num_files);
+    
+    // Create temp files
+    let mut temp_files = Vec::new();
+    let mut temp_writers = Vec::new();
+    
+    for i in 0..estimated_num_files {
+        let temp_path = config.output_dir.join(format!(".{}_temp_{:04}.jsonl", config.output_name, i));
+        let file = File::create(&temp_path).await?;
+        let writer = BufWriter::new(file);
+        temp_files.push(temp_path);
+        temp_writers.push(writer);
     }
     
-    println!("Wrote {} lines to {}", lines.len(), output_path.display());
+    // Initialize RNG with seed for deterministic behavior
+    let mut rng: Box<dyn RngCore> = match config.seed {
+        Some(seed) => Box::new(StdRng::seed_from_u64(seed)),
+        None => Box::new(thread_rng()),
+    };
+    let mut total_lines = 0;
     
-    Ok(output_path)
+    // Process input files in sorted order for deterministic behavior
+    let mut sorted_input_files = config.input_files.clone();
+    sorted_input_files.sort();
+    
+    // Process each input file
+    for input_file in &sorted_input_files {
+        println!("Processing {}", input_file.display());
+        
+        let file = File::open(input_file).await?;
+        let reader = BufReader::new(file);
+        let mut lines = reader.lines();
+        
+        while let Some(line) = lines.next_line().await? {
+            if !line.trim().is_empty() {
+                // Randomly assign to one of the temp files
+                let temp_index = rng.gen_range(0..temp_writers.len());
+                temp_writers[temp_index].write_all(line.as_bytes()).await?;
+                temp_writers[temp_index].write_all(b"\n").await?;
+                total_lines += 1;
+            }
+        }
+    }
+    
+    // Flush and close all temp writers
+    for mut writer in temp_writers {
+        writer.flush().await?;
+    }
+    
+    println!("Phase 1 complete: {} lines distributed across {} temp files", total_lines, temp_files.len());
+    
+    Ok(temp_files)
 }
 
-pub fn count_lines_in_file(file_path: &Path) -> Result<usize, io::Error> {
-    let content = fs::read_to_string(file_path)?;
-    Ok(content.lines().filter(|line| !line.trim().is_empty()).count())
+async fn phase_2_shuffle_and_write(
+    config: &ShuffleConfig,
+    temp_files: Vec<PathBuf>,
+) -> Result<Vec<PathBuf>, io::Error> {
+    println!("Phase 2: Shuffling temp files and writing final output...");
+    
+    let mut output_files = Vec::new();
+    let mut rng: Box<dyn RngCore> = match config.seed {
+        Some(seed) => Box::new(StdRng::seed_from_u64(seed.wrapping_add(1))), // Different seed for phase 2
+        None => Box::new(thread_rng()),
+    };
+    
+    for (i, temp_file) in temp_files.iter().enumerate() {
+        // Read all lines from this temp file
+        let mut lines = Vec::new();
+        let file = File::open(temp_file).await?;
+        let reader = BufReader::new(file);
+        let mut line_stream = reader.lines();
+        
+        while let Some(line) = line_stream.next_line().await? {
+            if !line.trim().is_empty() {
+                lines.push(line);
+            }
+        }
+        
+        // Skip empty temp files
+        if lines.is_empty() {
+            continue;
+        }
+        
+        // Shuffle the lines
+        lines.shuffle(&mut rng);
+        
+        // Write to final output file
+        let output_filename = if temp_files.len() == 1 {
+            format!("{}.jsonl", config.output_name)
+        } else {
+            format!("{}_part_{:04}.jsonl", config.output_name, i + 1)
+        };
+        
+        let output_path = config.output_dir.join(output_filename);
+        let output_file = File::create(&output_path).await?;
+        let mut writer = BufWriter::new(output_file);
+        
+        for line in &lines {
+            writer.write_all(line.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+        }
+        
+        writer.flush().await?;
+        output_files.push(output_path.clone());
+        
+        println!("Wrote {} lines to {}", lines.len(), output_path.display());
+        
+        // Clean up temp file
+        tokio::fs::remove_file(temp_file).await?;
+    }
+    
+    println!("Phase 2 complete: {} final output files created", output_files.len());
+    
+    Ok(output_files)
+}
+
+async fn estimate_total_input_size(input_files: &[PathBuf]) -> Result<usize, io::Error> {
+    let mut total_size = 0;
+    for file in input_files {
+        let metadata = tokio::fs::metadata(file).await?;
+        total_size += metadata.len() as usize;
+    }
+    Ok(total_size)
+}
+
+pub async fn count_lines_in_file(file_path: &Path) -> Result<usize, io::Error> {
+    let file = File::open(file_path).await?;
+    let reader = BufReader::new(file);
+    let mut lines = reader.lines();
+    let mut count = 0;
+    
+    while let Some(line) = lines.next_line().await? {
+        if !line.trim().is_empty() {
+            count += 1;
+        }
+    }
+    
+    Ok(count)
 }

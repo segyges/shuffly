@@ -26,6 +26,10 @@ struct Cli {
     /// Maximum size per output file in MB
     #[arg(short = 's', long, default_value_t = 100)]
     max_size_mb: usize,
+    
+    /// Random seed for deterministic shuffling
+    #[arg(long)]
+    seed: Option<u64>,
 }
 
 fn collect_jsonl_files(dir: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
@@ -59,7 +63,8 @@ fn collect_jsonl_files(dir: &str) -> Result<Vec<String>, Box<dyn std::error::Err
     Ok(jsonl_files)
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let cli = Cli::parse();
     
     // Determine input files
@@ -89,6 +94,7 @@ fn main() {
         &cli.output_dir,
         &cli.output_name,
         cli.max_size_mb,
+        cli.seed,
     ) {
         Ok(config) => config,
         Err(e) => {
@@ -97,7 +103,7 @@ fn main() {
         }
     };
     
-    match shuffly::shuffle_jsonl(&config) {
+    match shuffly::shuffle_jsonl(&config).await {
         Ok(output_files) => {
             println!("Successfully created {} output files:", output_files.len());
             for file in output_files {
