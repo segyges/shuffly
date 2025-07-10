@@ -1,8 +1,9 @@
 use std::path::{Path, PathBuf};
 use std::fs;
 use std::io;
+use async_compression::tokio::bufread::GzipDecoder;
 use tokio::fs::File;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use rand::prelude::*;
 use rand::rngs::StdRng;
 use rand::{SeedableRng, rng, RngCore};
@@ -103,26 +104,34 @@ async fn phase_1_distribute(config: &ShuffleConfig) -> Result<Vec<PathBuf>, io::
     // Process input files in sorted order for deterministic behavior
     let mut sorted_input_files = config.input_files.clone();
     sorted_input_files.sort();
-    
-    // Process each input file
-    for input_file in &sorted_input_files {
-        println!("Processing {}", input_file.display());
-        
-        let file = File::open(input_file).await?;
-        let reader = BufReader::new(file);
-        let mut lines = reader.lines();
-        
-        while let Some(line) = lines.next_line().await? {
-            if !line.trim().is_empty() {
-                // Randomly assign to one of the temp files
-                let temp_index = rng.random_range(0..temp_writers.len());
-                temp_writers[temp_index].write_all(line.as_bytes()).await?;
-                temp_writers[temp_index].write_all(b"\n").await?;
-                total_lines += 1;
-            }
-        }
-    }
-    
+			
+	// Process each input file
+		for input_file in &sorted_input_files {
+				println!("Processing {}", input_file.display());
+				
+				let file = File::open(input_file).await?;
+				let buf_reader = BufReader::new(file);
+				
+				// Create a boxed reader that can handle both cases
+				let reader: Box<dyn AsyncBufRead + Unpin> = if input_file.extension().and_then(|s| s.to_str()) == Some("gz") {
+						Box::new(BufReader::new(GzipDecoder::new(buf_reader)))
+				} else {
+						Box::new(buf_reader)
+				};
+				
+				let mut lines = reader.lines();
+				
+				while let Some(line) = lines.next_line().await? {
+						if !line.trim().is_empty() {
+								// Randomly assign to one of the temp files
+								let temp_index = rng.random_range(0..temp_writers.len());
+								temp_writers[temp_index].write_all(line.as_bytes()).await?;
+								temp_writers[temp_index].write_all(b"\n").await?;
+								total_lines += 1;
+						}
+				}
+		}
+				
     // Flush and close all temp writers
     for mut writer in temp_writers {
         writer.flush().await?;

@@ -16,6 +16,7 @@ pyo3 = { version = "0.25.0", optional = true }  # Make optional
 clap = { version = "4.0", features = ["derive"] }
 rand = "0.9.1"
 tokio = { version = "1.46.1", features = ["full"] }
+async-compression = { version = "0.4.25", features = ["tokio", "gzip"] }
 
 [features]
 default = []
