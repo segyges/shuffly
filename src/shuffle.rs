@@ -15,18 +15,21 @@ pub struct ShuffleConfig {
     pub output_dir: PathBuf,
     pub output_name: String,
     pub max_size_mb: usize,
+    pub delimiter: String,        // Add this field
+    pub file_extension: String,   // Add this field
     pub seed: Option<u64>,
 }
 
 impl ShuffleConfig {
     pub fn new(
-        input_files_str: &str,
+        input_files: Vec<PathBuf>,
         output_dir: &str,
         output_name: &str,
         max_size_mb: usize,
+        delimiter: &str,        // Add delimiter parameter
+        file_extension: &str,   // Add file extension parameter
         seed: Option<u64>,
     ) -> Result<Self, io::Error> {
-        let input_files = parse_input_files(input_files_str)?;
         let output_dir = PathBuf::from(output_dir);
         
         // Validate output directory exists or can be created
@@ -39,31 +42,14 @@ impl ShuffleConfig {
             output_dir,
             output_name: output_name.to_string(),
             max_size_mb,
+            delimiter: delimiter.to_string(),           // Store delimiter
+            file_extension: file_extension.to_string(), // Store file extension
             seed,
         })
     }
 }
 
-fn parse_input_files(input_str: &str) -> Result<Vec<PathBuf>, io::Error> {
-    let files: Vec<PathBuf> = input_str
-        .split(':')
-        .map(|s| PathBuf::from(s.trim()))
-        .collect();
-    
-    // Validate all files exist
-    for file in &files {
-        if !file.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Input file not found: {}", file.display())
-            ));
-        }
-    }
-    
-    Ok(files)
-}
-
-pub async fn shuffle_jsonl(config: &ShuffleConfig) -> Result<Vec<PathBuf>, io::Error> {
+pub async fn shuffle_files(config: &ShuffleConfig) -> Result<Vec<PathBuf>, io::Error> {
     // Phase 1: Distribute lines from input files to temporary files
     let temp_files = phase_1_distribute(config).await?;
     
@@ -109,6 +95,7 @@ async fn flush_line_buffer(
     buffer: &mut LineBuffer,
     temp_files: &[PathBuf],
     max_open_files: usize,
+		delimiter: &str
 ) -> Result<(), io::Error> {
     if buffer.is_empty() {
         return Ok(());
@@ -139,14 +126,14 @@ async fn flush_line_buffer(
         }
         
         // Write all lines for files in this batch
-        for (writer_idx, &file_idx) in indices.iter().enumerate() {
-            if let Some(lines) = lines_by_file.get(&file_idx) {
-                for line in lines {
-                    writers[writer_idx].write_all(line.as_bytes()).await?;
-                    writers[writer_idx].write_all(b"\n").await?;
-                }
+    for (writer_idx, &file_idx) in indices.iter().enumerate() {
+        if let Some(lines) = lines_by_file.get(&file_idx) {
+            for line in lines {
+                writers[writer_idx].write_all(line.as_bytes()).await?;
+                writers[writer_idx].write_all(delimiter.as_bytes()).await?;  // Use configured delimiter
             }
         }
+    }
         
         // Flush and close all writers in this batch
         for mut writer in writers {
@@ -171,10 +158,11 @@ async fn phase_1_distribute(config: &ShuffleConfig) -> Result<Vec<PathBuf>, io::
     // Create temp file paths (but don't open them yet)
     let mut temp_files = Vec::new();
     for i in 0..estimated_num_files {
-        let temp_path = config.output_dir.join(format!(".{}_temp_{:04}.jsonl", config.output_name, i));
+        let temp_path = config.output_dir.join(format!(".{}_temp_{:04}.{}", 
+            config.output_name, i, config.file_extension));
         temp_files.push(temp_path);
     }
-    
+
     // Configuration for batched processing
     const MAX_OPEN_INPUT_FILES: usize = 16;
     const MAX_OPEN_OUTPUT_FILES: usize = 128;
@@ -230,7 +218,7 @@ async fn phase_1_distribute(config: &ShuffleConfig) -> Result<Vec<PathBuf>, io::
                         
                         // Check if buffer is full
                         if line_buffer.is_full(MAX_BUFFER_SIZE) {
-                            flush_line_buffer(&mut line_buffer, &temp_files, MAX_OPEN_OUTPUT_FILES).await?;
+                            flush_line_buffer(&mut line_buffer, &temp_files, MAX_OPEN_OUTPUT_FILES, &config.delimiter).await?;
                         }
                     }
                 } else {
@@ -248,7 +236,7 @@ async fn phase_1_distribute(config: &ShuffleConfig) -> Result<Vec<PathBuf>, io::
     
     // Flush any remaining lines in the buffer
     if !line_buffer.is_empty() {
-        flush_line_buffer(&mut line_buffer, &temp_files, MAX_OPEN_OUTPUT_FILES).await?;
+        flush_line_buffer(&mut line_buffer, &temp_files, MAX_OPEN_OUTPUT_FILES, &config.delimiter).await?;
     }
     
     println!("Phase 1 complete: {} lines distributed across {} temp files", total_lines, temp_files.len());
@@ -290,20 +278,20 @@ async fn phase_2_shuffle_and_write(
         lines.shuffle(&mut rng);
         
         // Write to final output file
-        let output_filename = if temp_files.len() == 1 {
-            format!("{}.jsonl", config.output_name)
-        } else {
-            format!("{}_part_{:04}.jsonl", config.output_name, i + 1)
-        };
+				let output_filename = if temp_files.len() == 1 {
+						format!("{}.{}", config.output_name, config.file_extension)
+				} else {
+						format!("{:04}_{}.{}", config.output_name, i + 1, config.file_extension)
+				};
         
         let output_path = config.output_dir.join(output_filename);
         let output_file = File::create(&output_path).await?;
         let mut writer = BufWriter::new(output_file);
         
-        for line in &lines {
-            writer.write_all(line.as_bytes()).await?;
-            writer.write_all(b"\n").await?;
-        }
+				for line in &lines {
+						writer.write_all(line.as_bytes()).await?;
+						writer.write_all(config.delimiter.as_bytes()).await?;  // Use configured delimiter
+				}
         
         writer.flush().await?;
         output_files.push(output_path.clone());

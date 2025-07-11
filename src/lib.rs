@@ -19,7 +19,7 @@ fn shuffle_jsonl_py(
     let config = shuffle::ShuffleConfig::new(input_files, output_dir, output_name, max_size_mb)
         .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
     
-    let output_files = shuffle::shuffle_jsonl(&config)
+    let output_files = shuffle::shuffle_files(&config)
         .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
     
     Ok(output_files.into_iter().map(|p| p.to_string_lossy().to_string()).collect())
